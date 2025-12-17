@@ -1,0 +1,44 @@
+{
+  "name" : "mongodbconnection",
+  "jobMode" : "SCRIPT",
+  "description" : "",
+  "role" : "arn:aws:iam::116541189239:role/service-role/AWSGlueServiceRole-testdevopsetl",
+  "executionProperty" : {
+    "maxConcurrentRuns" : 1
+  },
+  "command" : {
+    "name" : "glueetl",
+    "scriptLocation" : "s3://aws-glue-assets-116541189239-ap-south-1/scripts/mongodbconnection.py",
+    "pythonVersion" : "3"
+  },
+  "defaultArguments" : {
+    "--enable-metrics" : "true",
+    "--enable-spark-ui" : "true",
+    "--spark-event-logs-path" : "s3://aws-glue-assets-116541189239-ap-south-1/sparkHistoryLogs/",
+    "--enable-job-insights" : "false",
+    "--additional-python-modules" : "pymongo[srv]==4.11.1",
+    "--enable-observability-metrics" : "true",
+    "--enable-glue-datacatalog" : "true",
+    "--job-bookmark-option" : "job-bookmark-disable",
+    "--job-language" : "python",
+    "--TempDir" : "s3://aws-glue-assets-116541189239-ap-south-1/temporary/",
+    "--extra-jars" : "s3://mongoconfigforglue/mongo/mongo-spark-connector_2.12-10.2.0.jar,s3://mongoconfigforglue/mongo/mongodb-driver-sync-4.11.1.jar,s3://mongoconfigforglue/mongo/bson-4.11.1.jar"
+  },
+  "connections" : {
+    "connections" : [ "Network connection" ]
+  },
+  "maxRetries" : 0,
+  "allocatedCapacity" : 2,
+  "timeout" : 480,
+  "maxCapacity" : 2.0,
+  "glueVersion" : "5.0",
+  "numberOfWorkers" : 2,
+  "workerType" : "G.1X",
+  "executionClass" : "STANDARD",
+  "sourceControlDetails" : {
+    "provider" : "GITHUB",
+    "repository" : "Analytics-ETL",
+    "branch" : "main",
+    "folder" : "multi_client_session_etl"
+  }
+}

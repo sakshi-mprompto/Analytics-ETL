@@ -13,7 +13,6 @@
   },
   "defaultArguments" : {
     "--enable-metrics" : "true",
-    "--enable-spark-ui" : "true",
     "--spark-event-logs-path" : "s3://aws-glue-assets-116541189239-ap-south-1/sparkHistoryLogs/",
     "--enable-job-insights" : "false",
     "--additional-python-modules" : "pymongo[srv]==4.11.1",

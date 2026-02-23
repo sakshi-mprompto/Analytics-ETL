@@ -11,7 +11,7 @@ from pyspark.sql.functions import (
     sum as sum_, min as min_, max as max_, first,
     count as count_, concat_ws, sha2, year, month,
     dayofmonth, format_string, coalesce, lit, concat, round, expr,
-    row_number, abs as abs_, broadcast
+    row_number, abs as abs_, broadcast, monotonically_increasing_id
 )
 
 # =============================================================================
@@ -30,18 +30,15 @@ BASE_S3_PATH = "s3a://mongodatamprompt/etl_data/partitioned/"
 MONGO_PROVIDER = "com.mongodb.spark.sql.connector.MongoTableProvider"
 
 # =============================================================================
-# --- DYNAMIC DATE CONFIGURATION (Yesterday Only) ---
-# COMMENT THESE OUT FOR RESTORE:
+# --- DYNAMIC DATE CONFIGURATION ---
+# Commented out for Manual Restore Mode
 current_date = datetime.utcnow()
 START_DATE_STR = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
 NEXT_DAY_STR = current_date.strftime("%Y-%m-%d")
 
-# --- MANUAL RESTORE MODE ---
-# Set these to your historical range. 
-# Example: To restore Nov 4th through Nov 30th:
-#START_DATE_STR = "2025-10-01" 
-#NEXT_DAY_STR = "2025-12-01"    # Must be 1 day AFTER your target end date!
-# =============================================================================
+# --- MANUAL RESTORE MODE (Batch 1: All of January 2026) ---
+#START_DATE_STR = "2026-02-01" 
+#NEXT_DAY_STR = "2026-02-23"
 
 SPLIT_THRESHOLD_SECONDS = 1800
 JOIN_GRACE_PERIOD_SECONDS = 10
@@ -50,11 +47,12 @@ JOIN_GRACE_PERIOD_SECONDS = 10
 # 2. CLIENT & TABLE CONFIGURATION
 # =============================================================================
 CLIENTS = [
-    {"folder_name": "kesari",   "mongo_prefix": "kesarishop"},
-    {"folder_name": "gardenia", "mongo_prefix": "gardenia"},
-    {"folder_name": "lanapaws", "mongo_prefix": "lanapaws-client"},
-   {"folder_name": "vuvatech", "mongo_prefix": "vuvatech-client"}
+    #{"folder_name": "kesari",   "mongo_prefix": "kesarishop"},
+    #{"folder_name": "gardenia", "mongo_prefix": "gardenia"},
+   # {"folder_name": "lanapaws", "mongo_prefix": "lanapaws-client"},
+    {"folder_name": "vuvatech", "mongo_prefix": "vuvatech-client"}
 ]
+
 STANDARD_TABLES = [
     {
         "mongo_suffix": "activity_logs_v2",
@@ -62,7 +60,7 @@ STANDARD_TABLES = [
         "time_col": "time",
         "user_col": "fingerprint",
         "force_mongo_string": ["details"], 
-        "complex_cols": []
+        "complex_cols": ["userAgent", "user_agent"] 
     },
     {
         "mongo_suffix": "user_sessions_v2",
@@ -91,7 +89,8 @@ STANDARD_TABLES = [
         "target_name": "fingerprint_v2",
         "time_col": "createdAt",
         "user_col": "fingerprint",
-        "complex_cols": ["userAgent"]
+        "complex_cols": ["userAgent", "user_agent"],
+        "full_load": False  # ✅ Set to False to ensure chunking uses the date range
     }
 ]
 
@@ -113,7 +112,6 @@ spark = (
     .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
     .config("spark.sql.session.timeZone", "UTC")
     .config("spark.sql.adaptive.enabled", "true")
-    # ✅ CORRECT HADOOP CONFIG: Prevents empty directory markers from generating
     .config("fs.s3a.directory.marker.retention", "keep") 
     .config("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
     .getOrCreate()
@@ -122,27 +120,28 @@ spark = (
 # =============================================================================
 # 4. HELPER FUNCTIONS
 # =============================================================================
-def get_mongo_pipeline(time_col, force_string_cols=None):
+def get_mongo_pipeline(time_col, force_string_cols=None, is_full_load=False):
     """Generates MongoDB Aggregation Pipeline for server-side filtering"""
-    pipeline = [
-        {
+    pipeline = []
+    
+    if not is_full_load:
+        pipeline.append({
             "$match": {
                 time_col: {
                     "$gte": {"$date": f"{START_DATE_STR}T00:00:00.000Z"},
                     "$lt":  {"$date": f"{NEXT_DAY_STR}T00:00:00.000Z"}
                 }
             }
-        }
-    ]
+        })
+
     if force_string_cols:
         conversions = {col_name: {"$toString": f"${col_name}"} for col_name in force_string_cols}
         pipeline.append({"$set": conversions})
+        
     return json.dumps(pipeline)
 
 def targeted_s3_cleanup(base_path, year, month, day):
-    """
-    Deletes $folder$ markers ONLY in the specified partition.
-    """
+    """Deletes $folder$ markers ONLY in the specified partition."""
     try:
         partition_path = f"{base_path}year={year}/month={month}/day={day}/"
         parsed = urlparse(partition_path)
@@ -165,10 +164,7 @@ def targeted_s3_cleanup(base_path, year, month, day):
         log.warning(f"⚠️ Targeted cleanup failed: {e}")
 
 def clean_partitions_in_range(base_path, start_date_str, next_day_str):
-    """
-    🚀 DYNAMIC RANGE CLEANUP: Safely loops through all dates processed by the job
-    and cleans them individually. Works for 1-day daily runs OR multi-day restores.
-    """
+    """Safely loops through all dates processed by the job and cleans them individually."""
     try:
         start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
         end_dt = datetime.strptime(next_day_str, "%Y-%m-%d")
@@ -189,86 +185,184 @@ def clean_partitions_in_range(base_path, start_date_str, next_day_str):
 # =============================================================================
 def process_table(client, table_cfg, session_lookup_df=None):
     source = f"{client['mongo_prefix']}_{table_cfg['mongo_suffix']}"
+    is_full_load = table_cfg.get("full_load", False)
+
     target = f"{BASE_S3_PATH}{client['folder_name']}/{table_cfg['target_name']}/"
 
-    log.info(f"--> Processing: {source}")
+    log.info(f"--> Processing: {source} (Full Load: {is_full_load})")
 
     try:
-        pipeline = get_mongo_pipeline(table_cfg["time_col"], table_cfg.get("force_mongo_string", []))
-        df = spark.read.format(MONGO_PROVIDER).option("connection.uri", MONGO_URI).option("database", DB).option("collection", source).option("pipeline", pipeline).load()
-        if df.rdd.isEmpty(): return None
-    except Exception as e:
-        log.warning(f"⚠️ Read failed. ({str(e)[:100]}...)"); return None
+        pipeline = get_mongo_pipeline(
+            table_cfg["time_col"],
+            table_cfg.get("force_mongo_string", []),
+            is_full_load=is_full_load
+        )
 
-    if "body" in df.columns: df = df.select("*", "body.*").drop("body")
+        df = (
+            spark.read.format(MONGO_PROVIDER)
+            .option("connection.uri", MONGO_URI)
+            .option("database", DB)
+            .option("collection", source)
+            .option("pipeline", pipeline)
+            .load()
+        )
+
+        # ✅ FAST EMPTY CHECK
+        if len(df.take(1)) == 0:
+            log.warning(f"⚠️ {source} returned 0 rows (after pipeline). Check Mongo field type for {table_cfg['time_col']}.")
+            return None
+
+    except Exception as e:
+        log.warning(f"⚠️ Read failed for {source}. ({str(e)[:140]}...)")
+        return None
+
+    if "body" in df.columns:
+        df = df.select("*", "body.*").drop("body")
+
     for c in table_cfg.get("force_mongo_string", []):
-        if c in df.columns: df = df.withColumn(c, to_json(col(c)))
+        if c in df.columns:
+            df = df.withColumn(c, to_json(col(c)))
+
     for c in table_cfg.get("complex_cols", []):
-        if c in df.columns: df = df.withColumn(c, to_json(col(c)))
+        if c in df.columns:
+            df = df.withColumn(c, to_json(col(c)))
+
     for old, new in COLUMN_RENAMES.items():
-        if old in df.columns: df = df.withColumnRenamed(old, new)
+        if old in df.columns:
+            df = df.withColumnRenamed(old, new)
 
     time_col = COLUMN_RENAMES.get(table_cfg["time_col"], table_cfg["time_col"])
     user_col = table_cfg["user_col"]
-    if user_col not in df.columns and "user_id" in df.columns: user_col = "user_id"
+    if user_col not in df.columns and "user_id" in df.columns:
+        user_col = "user_id"
 
     if time_col not in df.columns:
-        log.warning(f"!!! SKIPPING {source}: Could not find time column.")
+        log.warning(f"!!! SKIPPING {source}: Could not find time column '{time_col}'.")
         return None
 
-    df = df.withColumn("event_timestamp", to_timestamp(col(time_col))).withColumn("date", to_date(col("event_timestamp")))
-    df = df.filter((col("event_timestamp") >= to_timestamp(lit(f"{START_DATE_STR} 00:00:00"))) & (col("event_timestamp") < to_timestamp(lit(f"{NEXT_DAY_STR} 00:00:00"))))
+    df = df.withColumn("event_timestamp", to_timestamp(col(time_col)))
+    df = df.filter(col("event_timestamp").isNotNull())
+    df = df.withColumn("date", to_date(col("event_timestamp")))
 
+    # Only apply Spark date filtering if incremental or chunking
+    if not is_full_load:
+        df = df.filter(
+            (col("event_timestamp") >= to_timestamp(lit(f"{START_DATE_STR} 00:00:00"))) &
+            (col("event_timestamp") <  to_timestamp(lit(f"{NEXT_DAY_STR} 00:00:00")))
+        )
+
+    # ---------------------------
+    # Session table: build sessions
+    # ---------------------------
     if table_cfg.get("is_session_table"):
         log.info("    Applying Session Boundary Rules...")
         df = df.filter(col(user_col).isNotNull())
-        
-        # 🐞 LOGIC FIX 1: Deterministic Tie-Breaker for Window OrderBy
+
         sort_cols = [col("event_timestamp")]
-        if "mongo_id" in df.columns: sort_cols.append(col("mongo_id"))
+        if "mongo_id" in df.columns:
+            sort_cols.append(col("mongo_id"))
+
         w_user = Window.partitionBy(user_col, "date").orderBy(*sort_cols)
 
-        df = df.withColumn("prev_ts", lag("event_timestamp").over(w_user)).withColumn("is_new_session", when(col("prev_ts").isNull() | ((col("event_timestamp").cast("long") - col("prev_ts").cast("long")) > SPLIT_THRESHOLD_SECONDS), 1).otherwise(0)).withColumn("session_seq", sum_("is_new_session").over(w_user))
-        
+        df = (
+            df.withColumn("prev_ts", lag("event_timestamp").over(w_user))
+              .withColumn(
+                  "is_new_session",
+                  when(
+                      col("prev_ts").isNull() |
+                      ((col("event_timestamp").cast("long") - col("prev_ts").cast("long")) > SPLIT_THRESHOLD_SECONDS),
+                      1
+                  ).otherwise(0)
+              )
+              .withColumn("session_seq", sum_("is_new_session").over(w_user))
+        )
+
         w_seq = Window.partitionBy(user_col, "date", "session_seq")
         df = df.withColumn("session_start_marker", min_("event_timestamp").over(w_seq))
-        
+
         if "session_end_raw" in df.columns:
             df = df.withColumn("mongo_end_ts", to_timestamp(col("session_end_raw")))
-            df = df.withColumn("session_end", coalesce(max_("mongo_end_ts").over(w_seq), max_("event_timestamp").over(w_seq), col("session_start_marker")))
+            df = df.withColumn(
+                "session_end",
+                coalesce(
+                    max_("mongo_end_ts").over(w_seq),
+                    max_("event_timestamp").over(w_seq),
+                    col("session_start_marker")
+                )
+            )
         else:
             df = df.withColumn("session_end", max_("event_timestamp").over(w_seq))
 
-        df = df.withColumn("session_id", sha2(concat_ws("||", col(user_col), col("session_start_marker").cast("string")), 256))
+        df = df.withColumn(
+            "session_id",
+            sha2(concat_ws("||", col(user_col), col("session_start_marker").cast("string")), 256)
+        )
         df = df.withColumn("session_label", concat(col(user_col), lit("__"), col("session_start_marker").cast("string")))
 
         drop_cols = ["prev_ts", "is_new_session", "session_seq", "session_start_marker"]
-        if "mongo_end_ts" in df.columns: drop_cols.append("mongo_end_ts")
+        if "mongo_end_ts" in df.columns:
+            drop_cols.append("mongo_end_ts")
+
         df = df.withColumn("is_session_assigned", lit(True)).drop(*drop_cols)
 
-    elif session_lookup_df is not None and user_col in df.columns:
+    # ---------------------------
+    # Non-session tables: enrich with session lookup
+    # ---------------------------
+    elif session_lookup_df is not None and user_col in df.columns and not is_full_load:
         log.info("    Enriching with Session Lookup...")
-        joined = df.join(broadcast(session_lookup_df), (df[user_col] == session_lookup_df["sess_user"]) & (df["event_timestamp"] >= session_lookup_df["sess_start_window"]) & (df["event_timestamp"] <= session_lookup_df["sess_end_window"]), "left")
-        if "mongo_id" in joined.columns:
-            w_best = Window.partitionBy(joined["mongo_id"]).orderBy(abs_(joined["event_timestamp"].cast("long") - joined["sess_start_window"].cast("long")))
-            joined = joined.withColumn("rn", row_number().over(w_best)).filter(col("rn") == 1).drop("rn")
-        df = joined.withColumn("session_id", coalesce(col("session_id"), concat(col(user_col), lit("_"), col("date").cast("string"), lit("_unassigned"))))
-        df = df.withColumn("is_session_assigned", ~col("session_id").endswith("_unassigned")).drop("sess_user", "sess_start_window", "sess_end_window")
+        joined = df.join(
+            broadcast(session_lookup_df),
+            (df[user_col] == session_lookup_df["sess_user"]) &
+            (df["event_timestamp"] >= session_lookup_df["sess_start_window"]) &
+            (df["event_timestamp"] <= session_lookup_df["sess_end_window"]),
+            "left"
+        )
 
-    # 🐞 LOGIC FIX 2: Null-Safe Drop Duplicates to prevent Data Skew / OOM
+        # ✅ FALLBACK IF MONGO_ID IS MISSING
+        if "mongo_id" in joined.columns:
+            best_key = "mongo_id"
+        else:
+            joined = joined.withColumn("_row_id", monotonically_increasing_id())
+            best_key = "_row_id"
+
+        w_best = Window.partitionBy(joined[best_key]).orderBy(
+            abs_(joined["event_timestamp"].cast("long") - joined["sess_start_window"].cast("long"))
+        )
+
+        joined = joined.withColumn("rn", row_number().over(w_best)).filter(col("rn") == 1).drop("rn")
+
+        df = joined.withColumn(
+            "session_id",
+            coalesce(col("session_id"), concat(col(user_col), lit("_"), col("date").cast("string"), lit("_unassigned")))
+        )
+        df = (
+            df.withColumn("is_session_assigned", ~col("session_id").endswith("_unassigned"))
+              .drop("sess_user", "sess_start_window", "sess_end_window")
+        )
+        if "_row_id" in df.columns:
+            df = df.drop("_row_id")
+
+    # De-dup by mongo_id where possible
     if "mongo_id" in df.columns:
         df_clean = df.filter(col("mongo_id").isNotNull()).dropDuplicates(["mongo_id"])
         df_nulls = df.filter(col("mongo_id").isNull())
         df = df_clean.unionByName(df_nulls)
 
-    df = df.withColumn("year", year(col("date"))).withColumn("month", format_string("%02d", month(col("date")))).withColumn("day", format_string("%02d", dayofmonth(col("date"))))
-    df = df.repartition("year", "month", "day")
-    
+    # Partition columns
+    df = (
+        df.withColumn("year", year(col("date")))
+          .withColumn("month", format_string("%02d", month(col("date"))))
+          .withColumn("day", format_string("%02d", dayofmonth(col("date"))))
+    )
+
     log.info(f"    Writing to S3: {target}")
+
+    df = df.repartition("year", "month", "day")
     df.write.mode("overwrite").partitionBy("year", "month", "day").parquet(target)
 
-    # 🎯 TARGETED CLEANUP: Trigger dynamic range cleanup
-    clean_partitions_in_range(target, START_DATE_STR, NEXT_DAY_STR)
+    # Cleanup only for incremental/chunked loads
+    if not is_full_load:
+        clean_partitions_in_range(target, START_DATE_STR, NEXT_DAY_STR)
 
     return df
 
@@ -280,14 +374,21 @@ def build_session_master(client, session_df):
     target = f"{BASE_S3_PATH}{client['folder_name']}/session_master/"
     log.info(f"--> Building Session Master: {target}")
     
-    master_df = session_df.groupBy("session_id", "session_label", "fingerprint", "date").agg(min_("event_timestamp").alias("session_start_ts"), max_(to_timestamp(col("session_end"))).alias("session_end_ts"), count_(lit(1)).alias("event_count"))
+    sess_user_col = "fingerprint" if "fingerprint" in session_df.columns else ("user_id" if "user_id" in session_df.columns else None)
+    if not sess_user_col:
+        raise RuntimeError("Session DF has neither fingerprint nor user_id column.")
+
+    master_df = session_df.groupBy("session_id", "session_label", sess_user_col, "date").agg(
+        min_("event_timestamp").alias("session_start_ts"), 
+        max_(to_timestamp(col("session_end"))).alias("session_end_ts"), 
+        count_(lit(1)).alias("event_count")
+    )
     master_df = master_df.withColumn("session_duration", round(col("session_end_ts").cast("double") - col("session_start_ts").cast("double"), 4))
     master_df = master_df.withColumn("year", year(col("date"))).withColumn("month", format_string("%02d", month(col("date")))).withColumn("day", format_string("%02d", dayofmonth(col("date"))))
     
     master_df = master_df.dropDuplicates(["session_id"]).repartition("year", "month", "day")
     master_df.write.mode("overwrite").partitionBy("year", "month", "day").parquet(target)
     
-    # 🎯 TARGETED CLEANUP: Trigger dynamic range cleanup
     clean_partitions_in_range(target, START_DATE_STR, NEXT_DAY_STR)
 
 # =============================================================================
@@ -301,16 +402,24 @@ def main():
 
         session_cfg = next(t for t in STANDARD_TABLES if t.get("is_session_table"))
         session_df = process_table(client, session_cfg)
+        
         lookup = None
         if session_df is not None:
             session_df.cache()
             build_session_master(client, session_df)
-            lookup = session_df.groupBy("session_id").agg(first("fingerprint").alias("sess_user"), (min_("event_timestamp") - expr(f"INTERVAL {JOIN_GRACE_PERIOD_SECONDS} SECONDS")).alias("sess_start_window"), (max_(to_timestamp(col("session_end"))) + expr(f"INTERVAL {JOIN_GRACE_PERIOD_SECONDS} SECONDS")).alias("sess_end_window"))
+            lookup = session_df.groupBy("session_id").agg(
+                first("fingerprint").alias("sess_user"), 
+                (min_("event_timestamp") - expr(f"INTERVAL {JOIN_GRACE_PERIOD_SECONDS} SECONDS")).alias("sess_start_window"), 
+                (max_(to_timestamp(col("session_end"))) + expr(f"INTERVAL {JOIN_GRACE_PERIOD_SECONDS} SECONDS")).alias("sess_end_window")
+            )
         
         for table in STANDARD_TABLES:
-            if not table.get("is_session_table"): process_table(client, table, lookup)
+            if not table.get("is_session_table"): 
+                process_table(client, table, lookup)
         
-        if session_df is not None: session_df.unpersist()
+        if session_df is not None: 
+            session_df.unpersist()
+            
     log.info("\n=== ETL COMPLETED SUCCESSFULLY ===")
     spark.stop()
 

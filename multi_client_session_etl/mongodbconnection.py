@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pyspark.sql import SparkSession, Window
-from pyspark.sql.types import StringType, TimestampType, BooleanType, DoubleType, StructType, StructField, LongType, DateType
+from pyspark.sql.types import StringType, TimestampType, BooleanType, DoubleType, StructType, StructField, LongType, DateType, NullType
 from pyspark.sql.functions import (
     col, to_timestamp, to_date, to_json, when, lag,
     sum as sum_, min as min_, max as max_, first,
@@ -87,11 +87,11 @@ BROADCAST_SIZE_LIMIT_ROWS = 500_000
 # 2. CLIENT, TABLE & SCHEMA CONFIGURATION
 # =============================================================================
 CLIENTS = [
-  {"folder_name": "kesari",        "mongo_prefix": "kesarishop"},
+    {"folder_name": "kesari",        "mongo_prefix": "kesarishop"},
    {"folder_name": "gardenia",      "mongo_prefix": "gardenia"},
     {"folder_name": "lanapaws",      "mongo_prefix": "lanapaws-client"},
     {"folder_name": "vuvatech",      "mongo_prefix": "vuvatech-client"},
-    {"folder_name": "wellbi",        "mongo_prefix": "wellbi-client"},
+    {"folder_name": "wellbi",        "mongo_prefix": "wellbi-client"}
 ]
 
 STANDARD_TABLES = [
@@ -180,7 +180,6 @@ spark = (
 # =============================================================================
 # 4. AUDIT LOGGING SCHEMA & HELPERS
 # =============================================================================
-# 🚨 CLEANED SCHEMA: Percentages removed.
 AUDIT_SCHEMA = StructType([
     StructField("run_id",                    StringType(),    True),
     StructField("run_date",                  DateType(),      True),
@@ -390,7 +389,7 @@ def process_table(client, table_cfg, session_lookup_df=None):
         audit["status"] = "FAILED"
         audit["stage_failed"] = "READ"
         audit["error_message"] = str(e)[:500]
-        return None, audit # 🚨 UPDATE: Directly return audit instead of finalise_rates()
+        return None, audit
 
     # -------------------------------------------------------------------------
     # JSON STRINGIFICATION & RENAMES
@@ -495,7 +494,7 @@ def process_table(client, table_cfg, session_lookup_df=None):
         audit["stage_failed"] = "CLEANSING"
         audit["error_message"] = str(e)[:500]
         if cached_df is not None: cached_df.unpersist()
-        return None, audit # 🚨 UPDATE
+        return None, audit
 
     # -------------------------------------------------------------------------
     # TIMESTAMP PARSING & IST CONVERSION
@@ -507,7 +506,7 @@ def process_table(client, table_cfg, session_lookup_df=None):
             audit["stage_failed"] = "TIMESTAMP"
             audit["error_message"] = f"Time column '{time_col}' not found"
             df.unpersist()
-            return None, audit # 🚨 UPDATE
+            return None, audit
 
         before_ts = df.count() 
         df = df.withColumn("event_timestamp_utc", to_timestamp(col(time_col)))
@@ -542,7 +541,7 @@ def process_table(client, table_cfg, session_lookup_df=None):
         audit["stage_failed"] = "TIMESTAMP"
         audit["error_message"] = str(e)[:500]
         if cached_df is not None: cached_df.unpersist()
-        return None, audit # 🚨 UPDATE
+        return None, audit
 
     # =========================================================================
     # SESSION BOUNDARY LOGIC (user_sessions_v2 only)
@@ -610,7 +609,7 @@ def process_table(client, table_cfg, session_lookup_df=None):
             audit["stage_failed"] = "SESSION_BOUNDARY"
             audit["error_message"] = str(e)[:500]
             df.unpersist()
-            return None, audit # 🚨 UPDATE
+            return None, audit
 
     # =========================================================================
     # SESSION LOOKUP ENRICHMENT (all non-session tables)
@@ -661,7 +660,7 @@ def process_table(client, table_cfg, session_lookup_df=None):
             audit["stage_failed"] = "SESSION_ENRICHMENT"
             audit["error_message"] = str(e)[:500]
             df.unpersist()
-            return None, audit # 🚨 UPDATE
+            return None, audit
 
 
     # -------------------------------------------------------------------------
@@ -716,6 +715,14 @@ def process_table(client, table_cfg, session_lookup_df=None):
 
     df = enforce_schema(df)
 
+    # =========================================================================
+    # ✨ NEW: CATCH AND CAST VOID (NullType) COLUMNS FOR PARQUET COMPATIBILITY
+    # =========================================================================
+    for field in df.schema.fields:
+        if isinstance(field.dataType, NullType):
+            log.info(f"🔄 TYPE FIX: Casting VOID column '{field.name}' to StringType for Parquet compatibility.")
+            df = df.withColumn(field.name, col(field.name).cast(StringType()))
+
     # -------------------------------------------------------------------------
     # ADD PARTITION COLUMNS & WRITE
     # -------------------------------------------------------------------------
@@ -756,10 +763,10 @@ def process_table(client, table_cfg, session_lookup_df=None):
             audit["stage_failed"] = "WRITE"
             audit["error_message"] = str(e)[:500]
             df.unpersist()
-            return None, audit # 🚨 UPDATE
+            return None, audit
 
     if cached_df is not None: cached_df.unpersist()
-    return df, audit # 🚨 UPDATE
+    return df, audit
 
 # =============================================================================
 # 6. SESSION MASTER BUILDER
